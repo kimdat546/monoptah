@@ -138,6 +138,8 @@ impl CloudSessions {
         if crate::store::is_pending_cloud_environment(&session.project.environment_id) {
             return Err(STILL_STARTING.into());
         }
+        // The user is bringing it back on purpose: what was said about its last Stop is history.
+        self.forget_stop(&cloud);
         require_claude(&session.summary.provider)?;
         let name = cloud.name.clone();
         let _flight = {

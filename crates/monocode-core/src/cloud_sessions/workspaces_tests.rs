@@ -2,6 +2,7 @@
 //! numbers, the stop and delete flows (a sandbox that hibernates included) and degradation.
 use super::backend::docker::{SandboxShell, ShellOutput};
 use super::docker_start::StoreSecrets;
+use super::stopping::StopReport;
 use super::workspaces::*;
 use super::{CloudRef, CloudSessions, DeleteOutcome, Host};
 use crate::codespaces::{GhOutput, GhRunner};
@@ -172,6 +173,8 @@ struct Sbx {
     ls_fail: Mutex<std::collections::HashMap<Option<String>, Result<SbxOutput, String>>>,
     /// Once a box has read `stopped` it reads `running` again (something woke it).
     wake_after_stopped: Mutex<bool>,
+    /// `stop` fails with this.
+    stop_error: Mutex<Option<String>>,
 }
 
 impl Sbx {
@@ -185,6 +188,7 @@ impl Sbx {
             accounts: Mutex::new(vec![]),
             ls_fail: Mutex::new(Default::default()),
             wake_after_stopped: Mutex::new(false),
+            stop_error: Mutex::new(None),
         })
     }
     fn calls(&self) -> Vec<String> {
@@ -306,6 +310,9 @@ impl SbxRunner for Sbx {
                 let Some(b) = boxes.iter_mut().find(|b| b.id == args[1] && mine(b)) else {
                     return sbx_fail(&format!("error: sandbox '{}' not found", args[1]));
                 };
+                if let Some(error) = self.stop_error.lock().unwrap().clone() {
+                    return sbx_fail(&error);
+                }
                 b.state = "stopping".into();
                 sbx_ok(String::new())
             }
@@ -1684,4 +1691,386 @@ fn time_stamps_parse_from_rfc3339_and_bare_numbers() {
     assert_eq!(parse_time_ms("1794477600000"), Some(1_794_477_600_000));
     assert_eq!(parse_time_ms(""), None);
     assert_eq!(parse_time_ms("yesterday"), None);
+}
+
+// ------------------------------------------------- a Stop is closed first and then verified
+
+/// A host that has live connections to some sandboxes and notes, for each connection it closes,
+/// which sbx calls had run by then (so a test can tell the close came before the stop).
+struct LiveHost {
+    machines: Vec<Machine>,
+    sbx: Arc<Sbx>,
+    /// `(machine id, sbx calls made before it was closed)`.
+    closed: Mutex<Vec<(String, Vec<String>)>>,
+    /// Closing fails with this.
+    close_error: Mutex<Option<String>>,
+    disconnected: Mutex<Vec<String>>,
+}
+
+impl Host for LiveHost {
+    fn machines(&self) -> Result<Vec<Machine>, String> {
+        Ok(self.machines.clone())
+    }
+    fn connect(
+        &self,
+        _: &str,
+        _: &str,
+        _: &AtomicBool,
+        _: &mut dyn FnMut(&str),
+    ) -> Result<Machine, String> {
+        panic!("a stop must not connect")
+    }
+    fn ensure(&self, id: &str, _: &AtomicBool, _: &mut dyn FnMut(&str)) -> Result<(), String> {
+        panic!("a stop must not wake {id}")
+    }
+    fn request(&self, id: &str, method: &str, _: Value) -> Result<Value, String> {
+        panic!("unexpected host request {id} {method}")
+    }
+    fn disconnect(&self, id: &str) -> Result<(), String> {
+        self.disconnected.lock().unwrap().push(id.into());
+        Ok(())
+    }
+    fn close_connection(&self, id: &str) -> Result<bool, String> {
+        if let Some(error) = self.close_error.lock().unwrap().clone() {
+            return Err(error);
+        }
+        self.closed
+            .lock()
+            .unwrap()
+            .push((id.into(), self.sbx.calls()));
+        Ok(true)
+    }
+}
+
+fn machine_of(id: &str, sandbox_id: &str, name: &str) -> Machine {
+    Machine {
+        id: id.into(),
+        name: name.into(),
+        endpoint: "http://127.0.0.1:1".into(),
+        environment_id: format!("env-{id}"),
+        ssh: None,
+        codespace: None,
+        sandbox: Some(crate::remote::SandboxTarget {
+            id: sandbox_id.into(),
+            name: name.into(),
+            workspace: "/home/agent/ws".into(),
+            relay_port: 47200,
+            config: None,
+            mode: Default::default(),
+            docker_account: None,
+        }),
+    }
+}
+
+const WORKING: &str = "monoptah-fix-login-a1b2c3";
+
+/// A fixture whose clock the test moves, and whose host holds a live connection to `WORKING`
+/// (machine `m-1`) and to another sandbox (machine `m-2`).
+struct StopFx {
+    fx: Fx,
+    host: Arc<LiveHost>,
+    clock: Arc<std::sync::atomic::AtomicU64>,
+}
+
+fn stop_fx() -> StopFx {
+    let gh = Gh::new(json!([]));
+    let sbx = Sbx::new(vec![
+        bx("sbx_001a", WORKING, "running", 4, 8192, hours_ago(2.0)),
+        bx(
+            "sbx_001c",
+            "monoptah-other-c3d4e5",
+            "running",
+            2,
+            4096,
+            hours_ago(1.0),
+        ),
+    ]);
+    let host = Arc::new(LiveHost {
+        machines: vec![
+            machine_of("m-1", "sbx_001a", WORKING),
+            machine_of("m-2", "sbx_001c", "monoptah-other-c3d4e5"),
+        ],
+        sbx: sbx.clone(),
+        closed: Mutex::new(vec![]),
+        close_error: Mutex::new(None),
+        disconnected: Mutex::new(vec![]),
+    });
+    let store = Arc::new(Mutex::new(Store::open(Path::new(":memory:")).unwrap()));
+    let clock = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
+    let ticking = clock.clone();
+    let svc = CloudSessions::new(gh.clone(), host.clone(), store.clone())
+        .with_timing(
+            Duration::from_secs(5),
+            |_| {},
+            move || ticking.load(Ordering::SeqCst),
+        )
+        .with_origin(|_| Ok("git@github.com:octo/widgets.git".into()))
+        .with_sandboxes(
+            sbx.clone(),
+            Arc::new(NoSsh),
+            Arc::new(StoreSecrets::new(store.clone())),
+        );
+    add_session(&store, PROJECT, &CloudRef::sandbox(WORKING));
+    StopFx {
+        fx: Fx {
+            svc,
+            gh,
+            sbx,
+            store,
+            sleeps: Arc::new(AtomicUsize::new(0)),
+        },
+        host,
+        clock,
+    }
+}
+
+impl StopFx {
+    fn cloud(&self) -> CloudRef {
+        CloudRef::sandbox(WORKING)
+    }
+    fn advance(&self, secs: u64) {
+        self.clock.fetch_add(secs * 1000, Ordering::SeqCst);
+    }
+    /// A forced read of the listing, as the dialog and the chip do it.
+    fn read(&self) -> WorkspaceRow {
+        let view = self.fx.svc.workspaces_overview(PROJECT, true);
+        row(&view, WORKING).clone()
+    }
+    fn set_state(&self, state: &str) {
+        self.fx.sbx.boxes.lock().unwrap()[0].state = state.into();
+    }
+}
+
+#[test]
+fn a_stop_closes_the_sessions_connection_to_that_sandbox_before_it_sends_the_stop() {
+    let t = stop_fx();
+    t.fx.svc.stop_cloud(&t.cloud()).unwrap();
+    let closed = t.host.closed.lock().unwrap().clone();
+    assert_eq!(
+        closed.len(),
+        1,
+        "only the machine of this sandbox: {closed:?}"
+    );
+    assert_eq!(closed[0].0, "m-1");
+    assert!(
+        !closed[0].1.iter().any(|call| call.starts_with("stop")),
+        "the connection was still open when the stop went out: {:?}",
+        closed[0].1
+    );
+    assert!(t
+        .fx
+        .sbx
+        .calls()
+        .iter()
+        .any(|call| call.starts_with("stop sbx_001a")));
+    // It only stops: the machine is kept for Reconnect and nothing is deleted.
+    assert!(t.host.disconnected.lock().unwrap().is_empty());
+    assert!(!t.fx.sbx.verbs().contains(&"rm".to_owned()));
+    assert_eq!(t.fx.sbx.state_of("sbx_001a").as_deref(), Some("stopping"));
+    assert_eq!(
+        t.fx.sbx.state_of("sbx_001c").as_deref(),
+        Some("running"),
+        "another sandbox is not touched"
+    );
+}
+
+#[test]
+fn a_stop_that_cannot_close_the_connection_still_stops_and_says_so_when_it_comes_back() {
+    let t = stop_fx();
+    *t.host.close_error.lock().unwrap() = Some("tunnel lock poisoned".into());
+    t.fx.svc.stop_cloud(&t.cloud()).unwrap();
+    assert_eq!(t.fx.sbx.state_of("sbx_001a").as_deref(), Some("stopping"));
+    // Something wakes it again.
+    t.set_state("running");
+    t.advance(120);
+    let row = t.read();
+    match row.stop {
+        Some(StopReport::StillRunning(reason)) => assert!(
+            reason.contains("could not close") && reason.contains("tunnel lock poisoned"),
+            "{reason}"
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_stop_is_followed_from_stopping_to_stopped_by_the_listing() {
+    let t = stop_fx();
+    t.fx.svc.stop_cloud(&t.cloud()).unwrap();
+    let requested = t.clock.load(Ordering::SeqCst);
+
+    t.advance(20);
+    let row = t.read();
+    assert_eq!(row.state, WorkspaceState::Stopping);
+    assert_eq!(row.stop, Some(StopReport::Stopping));
+    assert_eq!(
+        row.stopping_since_ms,
+        Some(requested),
+        "counted from the request"
+    );
+
+    t.set_state("stopped");
+    t.advance(20);
+    let row = t.read();
+    assert_eq!(row.state, WorkspaceState::Stopped);
+    assert_eq!(row.stop, Some(StopReport::Stopped));
+    assert_eq!(row.stopping_since_ms, None);
+    // Nothing woke it to find out: only listings, and the one stop.
+    assert_eq!(
+        t.fx.sbx.verbs().iter().filter(|v| *v == "stop").count(),
+        1,
+        "{:?}",
+        t.fx.sbx.calls()
+    );
+}
+
+#[test]
+fn a_stop_that_takes_longer_than_expected_is_said_so_and_keeps_counting() {
+    let t = stop_fx();
+    t.fx.svc.stop_cloud(&t.cloud()).unwrap();
+    t.advance(STOP_EXPECTED_SECS - 1);
+    assert_eq!(t.read().stop, Some(StopReport::Stopping));
+    t.advance(1);
+    let row = t.read();
+    assert_eq!(row.state, WorkspaceState::Stopping);
+    assert_eq!(row.stop, Some(StopReport::TakingLong));
+    t.advance(20 * 60);
+    let row = t.read();
+    assert_eq!(row.stop, Some(StopReport::TakingLong));
+    assert_eq!(
+        row.stopping_since_ms,
+        Some(now_ms()),
+        "still counted from the request, not from the last read"
+    );
+}
+
+const STOP_EXPECTED_SECS: u64 = 10 * 60;
+
+#[test]
+fn a_sandbox_that_is_running_again_after_a_stop_is_told_never_silently_running() {
+    let t = stop_fx();
+    t.fx.svc.stop_cloud(&t.cloud()).unwrap();
+    // Within the grace period a listing that has not caught up is not yet a verdict.
+    t.set_state("running");
+    t.advance(30);
+    let row = t.read();
+    assert_eq!(row.state, WorkspaceState::Running);
+    assert_eq!(row.stop, Some(StopReport::Stopping));
+
+    t.advance(60);
+    let row = t.read();
+    let Some(StopReport::StillRunning(reason)) = row.stop.clone() else {
+        panic!("{:?}", row.stop)
+    };
+    assert!(
+        reason.contains("Auto-resume") && reason.contains("closed its own connection"),
+        "{reason}"
+    );
+    // It stays said until the user acts, however long after.
+    t.advance(3600);
+    assert_eq!(t.read().stop, row.stop);
+    // Another Stop starts over.
+    t.fx.svc.stop_cloud(&t.cloud()).unwrap();
+    assert_eq!(t.read().stop, Some(StopReport::Stopping));
+}
+
+#[test]
+fn a_hibernating_sandbox_counts_as_stopping_and_one_nobody_stopped_is_timed_from_first_sight() {
+    let t = stop_fx();
+    t.set_state("hibernating");
+    let first_seen = t.clock.load(Ordering::SeqCst);
+    t.advance(5);
+    let row = t.read();
+    assert_eq!(row.state, WorkspaceState::Hibernating);
+    // Not this app's stop: counted from the first listing that showed it going down.
+    assert_eq!(row.stopping_since_ms, Some(first_seen + 5000));
+    assert_eq!(
+        row.stop, None,
+        "nobody asked this app to stop it: no report, no polling"
+    );
+    t.advance(300);
+    assert_eq!(t.read().stopping_since_ms, Some(first_seen + 5000));
+    t.set_state("stopped");
+    let row = t.read();
+    assert_eq!(row.stopping_since_ms, None);
+    assert_eq!(row.stop, None, "no Stop of this app to report on");
+}
+
+#[test]
+fn a_stop_the_cli_refuses_is_an_error_and_nothing_is_followed() {
+    let t = stop_fx();
+    *t.fx.sbx.stop_error.lock().unwrap() = Some("error: cloud API returned 503".into());
+    let error = t.fx.svc.stop_cloud(&t.cloud()).unwrap_err();
+    assert!(error.contains("503"), "{error}");
+    assert!(
+        error.contains("Reconnect"),
+        "it says the sessions lost their connection: {error}"
+    );
+    assert_eq!(t.read().stop, None);
+}
+
+#[test]
+fn a_stopped_codespace_closes_no_connection() {
+    let gh = Gh::new(json!([codespace(
+        "octo-used",
+        "basicLinux32gb",
+        "Available",
+        hours_ago(3.0)
+    )]));
+    let t = stop_fx();
+    let svc = CloudSessions::new(gh, t.host.clone(), t.fx.store.clone());
+    svc.stop_cloud(&CloudRef::codespace("octo-used")).unwrap();
+    assert!(t.host.closed.lock().unwrap().is_empty());
+}
+
+#[test]
+fn deleting_a_stopped_sandbox_forgets_the_stop_that_was_followed() {
+    let t = stop_fx();
+    t.fx.svc.stop_cloud(&t.cloud()).unwrap();
+    t.set_state("stopped");
+    t.fx.svc.delete_cloud_outcome(&t.cloud()).unwrap();
+    assert!(t.fx.sbx.state_of("sbx_001a").is_none());
+    assert_eq!(t.fx.svc.stops.lock().unwrap().followed(), 0);
+    let view = t.fx.svc.workspaces_overview(PROJECT, true);
+    assert!(view.rows.iter().all(|r| r.cloud.name != WORKING));
+}
+
+#[test]
+fn a_listing_that_shows_a_sandbox_down_closes_the_tunnel_that_would_wake_it_again() {
+    let t = stop_fx();
+    // Someone else stopped it (the TTL, another computer): this app's tunnel is still open.
+    t.set_state("stopped");
+    t.read();
+    let closed = t.host.closed.lock().unwrap().clone();
+    assert_eq!(
+        closed.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        ["m-1"],
+        "only the machine of the stopped sandbox: {closed:?}"
+    );
+    assert!(
+        t.host.disconnected.lock().unwrap().is_empty(),
+        "the machine is kept"
+    );
+    // Nothing was woken or deleted to find out.
+    assert_eq!(t.fx.sbx.verbs().iter().filter(|v| *v == "ls").count(), 1);
+    assert!(!t
+        .fx
+        .sbx
+        .verbs()
+        .iter()
+        .any(|v| matches!(v.as_str(), "stop" | "rm")));
+}
+
+#[test]
+fn a_running_sandbox_keeps_its_tunnel_and_so_does_one_a_reconnect_is_bringing_back() {
+    let t = stop_fx();
+    t.read();
+    assert!(t.host.closed.lock().unwrap().is_empty());
+    t.set_state("stopped");
+    t.fx.svc.reconnecting.lock().unwrap().insert(WORKING.into());
+    t.read();
+    assert!(
+        t.host.closed.lock().unwrap().is_empty(),
+        "the user is resuming it right now"
+    );
 }

@@ -126,6 +126,8 @@ pub(crate) struct CloudWorkspacesDialog {
     reload_queued: Option<bool>,
     /// The last failed action or browser lookup, by [`WorkspaceRow::key`].
     errors: HashMap<String, String>,
+    /// A read of the listing is scheduled because a Stop is being followed.
+    following_stop: bool,
     focus: FocusHandle,
 }
 
@@ -172,6 +174,7 @@ impl CloudWorkspacesDialog {
             warnings: Vec::new(),
             reload_queued: None,
             errors: HashMap::new(),
+            following_stop: false,
             focus: cx.focus_handle(),
         };
         // Opening is one of the two moments the CLIs are asked; the service answers from its
@@ -216,7 +219,33 @@ impl CloudWorkspacesDialog {
                     }
                     Err(error) => this.load_error = Some(error),
                 }
+                this.follow_stops(cx);
                 cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// While a Stop is on its way (the listing says stopping, or has not caught up), reads the
+    /// listing again by itself, so the row says Stopped, Still running or Taking longer than
+    /// expected without a click on Refresh. Read-only: it never wakes anything.
+    fn follow_stops(&mut self, cx: &mut Context<Self>) {
+        if self.following_stop {
+            return;
+        }
+        let Some(every) = self
+            .view
+            .as_ref()
+            .and_then(|view| model::stop_poll(view.rows.iter().filter_map(|row| row.stop.clone())))
+        else {
+            return;
+        };
+        self.following_stop = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(every).await;
+            let _ = this.update(cx, |this, cx| {
+                this.following_stop = false;
+                this.load(true, cx);
             });
         })
         .detach();
@@ -654,6 +683,31 @@ impl CloudWorkspacesDialog {
                     .child(model::cost_line(row)),
             );
 
+        if let Some((text, tone)) = model::stop_line(row, now) {
+            card = card.child(
+                div()
+                    .id(SharedString::from(id("stop-report")))
+                    .debug_selector({
+                        let selector = id("stop-report");
+                        move || selector.clone()
+                    })
+                    .flex()
+                    .items_start()
+                    .gap(px(6.))
+                    .text_size(px(12.))
+                    .line_height(px(18.))
+                    .text_color(content(0.75))
+                    .child(
+                        div()
+                            .mt(px(5.))
+                            .size(px(7.))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .bg(tone_color(tone)),
+                    )
+                    .child(div().min_w_0().flex_1().child(text)),
+            );
+        }
         if let Some(error) = self.errors.get(&key) {
             card = card.child(alert(id("error"), error.clone()));
         }

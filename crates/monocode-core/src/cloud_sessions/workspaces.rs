@@ -29,6 +29,7 @@
 //!   did not see.
 //! * Costs are ESTIMATES: see the rate constants below.
 use super::move_session::{pending_moves, MoveTarget};
+use super::stopping::StopReport;
 use super::{
     convert, docker_config, start_record, CloudBackendKind, CloudRef, CloudSessions, CloudState,
     DeleteOutcome, InstanceSession,
@@ -299,6 +300,13 @@ pub struct WorkspaceRow {
     pub cost: CostEstimate,
     /// The backend has a web page for it (a codespace).
     pub has_web: bool,
+    /// Since when it has been stopping, in milliseconds since the epoch: from the Stop this app
+    /// had accepted, else from the first listing that showed it stopping. `None` unless the
+    /// state is stopping. The footer chip warns when this is old.
+    pub stopping_since_ms: Option<u64>,
+    /// What became of the last Stop this app asked for, read from the listing (see
+    /// [`super::stopping`]); `None` when there is nothing to tell.
+    pub stop: Option<StopReport>,
 }
 
 impl WorkspaceRow {
@@ -520,6 +528,8 @@ impl CloudSessions {
         }
         self.load_sandboxes(project, now, &mut view);
         order(&mut view.rows);
+        self.apply_stop_reports(&mut view.rows, now);
+        self.close_connections_of_stopped(&view.rows);
         view
     }
 
@@ -634,6 +644,8 @@ impl CloudSessions {
             last_used_ms: parse_time_ms(&c.last_used_at),
             cost: CostEstimate::compute(rate, state, created_ms, now),
             has_web: true,
+            stopping_since_ms: None,
+            stop: None,
             git,
             id: None,
             account: None,
@@ -685,6 +697,8 @@ impl CloudSessions {
             last_used_ms: None,
             cost: CostEstimate::compute(rate, state, created_ms, now),
             has_web: false,
+            stopping_since_ms: None,
+            stop: None,
             git: None,
             cloud,
         })

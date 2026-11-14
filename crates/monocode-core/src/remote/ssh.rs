@@ -1344,6 +1344,16 @@ impl Tunnels {
     }
     pub fn remove(&self, id: &str) {
         let old = self.slots().remove(id);
+        // A request in flight may still hold the slot through its lease; the tunnel itself is
+        // closed now, not when the last lease is dropped.
+        if let Some(old) = &old {
+            let tunnel = old
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .tunnel
+                .take();
+            drop(tunnel);
+        }
         drop(old);
     }
     /// A live tunnel for `id`, or None. Never spawns a process and holds the
