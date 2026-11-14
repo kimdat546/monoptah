@@ -579,12 +579,18 @@ pub trait Host: Send + Sync {
     }
     fn disconnect(&self, machine_id: &str) -> Result<(), String>;
     /// Closes the live connection of a machine (its tunnel) and keeps the machine, so a later
-    /// explicit Reconnect pairs it again. Returns whether a live connection was closed. A
-    /// Stop uses this: a sandbox with Auto-resume starts again for anything that connects to
-    /// it, an open tunnel included. The default has no connection to close.
-    fn close_connection(&self, machine_id: &str) -> Result<bool, String> {
-        let _ = machine_id;
-        Ok(false)
+    /// explicit Reconnect pairs it again. A Stop uses this: a sandbox with Auto-resume starts
+    /// again for anything that connects to it, an open tunnel included. `listed_at_ms` is the
+    /// moment of the listing that asked (a close that follows a listing): a connection opened
+    /// after it is left alone. `None` closes whatever is open (a Stop being sent). Never waits.
+    /// The default has no connection to close.
+    fn close_connection(
+        &self,
+        machine_id: &str,
+        listed_at_ms: Option<u64>,
+    ) -> Result<remote::TunnelClose, String> {
+        let _ = (machine_id, listed_at_ms);
+        Ok(remote::TunnelClose::NoneOpen)
     }
 }
 
@@ -695,8 +701,15 @@ impl Host for Arc<Connections> {
     fn disconnect(&self, machine_id: &str) -> Result<(), String> {
         Connections::disconnect(self, machine_id)
     }
-    fn close_connection(&self, machine_id: &str) -> Result<bool, String> {
-        Ok(Connections::close_tunnel(self, machine_id))
+    fn close_connection(
+        &self,
+        machine_id: &str,
+        listed_at_ms: Option<u64>,
+    ) -> Result<remote::TunnelClose, String> {
+        Ok(match listed_at_ms {
+            Some(listed) => Connections::close_tunnel_started_before(self, machine_id, listed),
+            None => Connections::close_tunnel(self, machine_id),
+        })
     }
 }
 
@@ -1688,7 +1701,7 @@ impl CloudSessions {
                 Err(error)
             };
         }
-        let connection = self.close_connections_before_stop(cloud);
+        let connection = self.close_connections_before_stop(cloud, None);
         let stopped = match backend.stop(&cloud.name) {
             // An instance that no longer exists (deleted by another process or by hand) is
             // as stopped as it can be, so this is not an error. The delete follows the same
@@ -1718,8 +1731,13 @@ impl CloudSessions {
 
     /// Closes the connections this app holds to the sandbox `cloud` (a tunnel per session
     /// machine). A codespace is left alone: `gh codespace ssh` is what wakes it, and nothing
-    /// holds one open.
-    fn close_connections_before_stop(&self, cloud: &CloudRef) -> stopping::Connection {
+    /// holds one open. `listed_at_ms` is `Some` when a listing asked: only a tunnel started
+    /// before it is closed.
+    fn close_connections_before_stop(
+        &self,
+        cloud: &CloudRef,
+        listed_at_ms: Option<u64>,
+    ) -> stopping::Connection {
         if cloud.kind != CloudBackendKind::DockerSandbox {
             return stopping::Connection::NoneOpen;
         }
@@ -1728,6 +1746,7 @@ impl CloudSessions {
             Err(error) => return stopping::Connection::CloseFailed(error),
         };
         let mut closed = 0;
+        let mut deferred = false;
         let mut failed = None;
         for machine in machines {
             let ours = machine
@@ -1737,9 +1756,10 @@ impl CloudSessions {
             if !ours {
                 continue;
             }
-            match self.host.close_connection(&machine.id) {
-                Ok(true) => closed += 1,
-                Ok(false) => {}
+            match self.host.close_connection(&machine.id, listed_at_ms) {
+                Ok(remote::TunnelClose::Closed) => closed += 1,
+                Ok(remote::TunnelClose::NoneOpen) => {}
+                Ok(remote::TunnelClose::Deferred) => deferred = true,
                 Err(error) => {
                     failed.get_or_insert(error);
                 }
@@ -1747,6 +1767,7 @@ impl CloudSessions {
         }
         match failed {
             Some(error) => stopping::Connection::CloseFailed(error),
+            None if deferred => stopping::Connection::Deferred,
             None if closed > 0 => stopping::Connection::Closed(closed),
             None => stopping::Connection::NoneOpen,
         }

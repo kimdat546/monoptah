@@ -86,6 +86,8 @@ pub(super) enum Connection {
     Closed(usize),
     /// Closing failed; the stop was sent anyway.
     CloseFailed(String),
+    /// A request or a start held the connection's lock: it closes when that ends.
+    Deferred,
 }
 
 impl Connection {
@@ -95,6 +97,10 @@ impl Connection {
             Self::CloseFailed(error) => Some(format!(
                 "Stop sent, but the app could not close its connection to it ({error}); that connection may wake the sandbox again."
             )),
+            Self::Deferred => Some(
+                "Stop sent, but the app's connection to it is busy and will close when its request ends; it may wake the sandbox again."
+                    .to_owned(),
+            ),
             _ => None,
         }
     }
@@ -103,6 +109,10 @@ impl Connection {
 #[derive(Clone, Debug, Default)]
 pub(super) struct StopWatch {
     cloud: Option<CloudRef>,
+    /// The projects (path keys) whose listing shows this sandbox: the projects of its sessions
+    /// and of the local sessions moved into it. Empty: a sandbox no session uses, which every
+    /// project lists. A load of another project says nothing about this Stop.
+    projects: Vec<String>,
     /// When this process had the stop accepted; cleared once the listing settled.
     requested_ms: Option<u64>,
     /// Since when the listing has said stopping.
@@ -122,6 +132,10 @@ fn reason(connection: &Connection, when: &str) -> String {
         }
         Connection::CloseFailed(error) => {
             format!("Monoptah could not close its own connection to it before stopping ({error}).")
+        }
+        Connection::Deferred => {
+            "Monoptah's own connection to it was busy and could only be closed after its request ended."
+                .to_owned()
         }
     };
     format!(
@@ -200,6 +214,10 @@ impl StopWatches {
     pub(super) fn followed(&self) -> usize {
         self.watches.len()
     }
+    /// How many sandboxes have a count of consecutive "down" listings.
+    pub(super) fn down_counted(&self) -> usize {
+        self.down.len()
+    }
 }
 
 impl CloudSessions {
@@ -212,6 +230,16 @@ impl CloudSessions {
             return;
         }
         let now = (self.clock)();
+        // Read before the lock: these ask the store.
+        let mut projects: Vec<String> = self
+            .sessions_on(cloud)
+            .into_iter()
+            .filter_map(|s| s.local_project)
+            .chain(self.moved_projects(cloud))
+            .map(|p| crate::files::path_key(&p))
+            .collect();
+        projects.sort();
+        projects.dedup();
         if let Ok(mut watches) = self.stops.lock() {
             let key = cloud.key();
             let kept = watches
@@ -223,6 +251,7 @@ impl CloudSessions {
                 key,
                 StopWatch {
                     cloud: Some(cloud.clone()),
+                    projects,
                     requested_ms: Some(kept.unwrap_or(now)),
                     connection,
                     ..StopWatch::default()
@@ -239,6 +268,32 @@ impl CloudSessions {
         }
     }
 
+    /// Dismisses the `Still running: …` line of `cloud`: the user knows (they resumed it by other
+    /// means, such as `sbx run` or another computer) and does not want it kept until the next
+    /// Stop. Only a verdict that is settled is dismissed; a Stop still on its way is not.
+    /// Returns whether something was dismissed. Cached overviews are forgotten so the chip and the
+    /// dialog read again.
+    pub fn dismiss_stop(&self, cloud: &CloudRef) -> bool {
+        let dismissed = match self.stops.lock() {
+            Ok(mut watches) => {
+                let settled = matches!(
+                    watches.watches.get(&cloud.key()),
+                    Some(watch) if matches!(watch.settled, Some(StopReport::StillRunning(_)))
+                        && watch.requested_ms.is_none()
+                );
+                if settled {
+                    watches.watches.remove(&cloud.key());
+                }
+                settled
+            }
+            Err(_) => false,
+        };
+        if dismissed {
+            self.forget_workspace_views();
+        }
+        dismissed
+    }
+
     /// Closes the connections this app still holds to a sandbox the listing says is stopping or
     /// stopped. A tunnel survives a stop (its keepalives are answered by the gateway), and the
     /// first request a session sends through it resumes the sandbox again: that is what a Stop
@@ -247,7 +302,15 @@ impl CloudSessions {
     /// It closes only after [`DOWN_READS`] consecutive listings showed the sandbox down, and
     /// never while the user's own Reconnect is bringing it back or a start of it is pending
     /// (another flow may just have opened a connection a stale listing knows nothing about).
-    pub(super) fn close_connections_of_stopped(&self, rows: &[WorkspaceRow]) {
+    ///
+    /// `listed_at_ms` is when the listing was READ: a connection opened after it (a Reconnect
+    /// that finished while this listing was being processed) is left alone.
+    pub(super) fn close_connections_of_stopped(&self, rows: &[WorkspaceRow], listed_at_ms: u64) {
+        if let Ok(mut watches) = self.stops.lock() {
+            // A sandbox that is no longer listed has nothing to count.
+            let listed: Vec<String> = rows.iter().map(|row| row.cloud.key()).collect();
+            watches.down.retain(|key, _| listed.contains(key));
+        }
         for row in rows {
             if row.cloud.kind != CloudBackendKind::DockerSandbox {
                 continue;
@@ -282,7 +345,7 @@ impl CloudSessions {
                     .any(|r| r.cloud().as_ref() == Some(&row.cloud))
             });
             if !bringing_back && !starting {
-                let _ = self.close_connections_before_stop(&row.cloud);
+                let _ = self.close_connections_before_stop(&row.cloud, Some(listed_at_ms));
             }
         }
     }
@@ -320,18 +383,32 @@ impl CloudSessions {
             }
         }
         let readable = view.sandbox_problems.is_empty();
+        let this_project = crate::files::path_key(&view.project);
         let mut dropped = Vec::new();
         for (key, watch) in watches.watches.iter_mut() {
-            let (Some(cloud), Some(requested)) = (&watch.cloud, watch.requested_ms) else {
+            let Some(cloud) = &watch.cloud else {
                 continue;
             };
             if listed.contains(key) {
                 continue;
             }
+            // Another project's load does not list this sandbox when sessions of other projects
+            // use it: it says nothing about this Stop, so it is not a missing read.
+            if !watch.projects.is_empty() && !watch.projects.contains(&this_project) {
+                continue;
+            }
             watch.missing_reads += 1;
-            let too_old = now.saturating_sub(requested) >= UNREAD_LIMIT.as_millis() as u64;
+            let followed = watch.requested_ms;
+            let too_old = followed.is_some_and(|requested| {
+                now.saturating_sub(requested) >= UNREAD_LIMIT.as_millis() as u64
+            });
             if (readable && watch.missing_reads >= MISSING_READS) || too_old {
                 dropped.push(key.clone());
+                continue;
+            }
+            // A settled verdict (Stopped, or Still running) of a sandbox that is gone is dropped
+            // quietly above; only a Stop still on its way is worth a line.
+            if followed.is_none() {
                 continue;
             }
             let why = if readable {

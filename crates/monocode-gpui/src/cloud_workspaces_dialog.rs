@@ -46,6 +46,7 @@ use gpui::{
 use monocode_core::{
     cloud_sessions::{
         CloudRef,
+        stopping::StopReport,
         workspaces::{self, DeletePreview, WorkspaceOverview, WorkspaceRow, WorkspaceTarget},
     },
     mono::cloud_api::{CloudApi, DeleteOptions},
@@ -236,6 +237,20 @@ impl CloudWorkspacesDialog {
             });
         })
         .detach();
+    }
+
+    /// Dismiss was pressed on a `Still running: …` line: the core forgets that verdict and the
+    /// row loses its line at once; the chip reads again at its next tick.
+    fn dismiss_stop(&mut self, cloud: &CloudRef, cx: &mut Context<Self>) {
+        if let Ok(api) = self.env.api() {
+            api.cloud().dismiss_stop(cloud);
+        }
+        if let Some(view) = self.view.as_mut() {
+            for row in view.rows.iter_mut().filter(|row| row.cloud == *cloud) {
+                row.stop = None;
+            }
+        }
+        cx.notify();
     }
 
     /// While a Stop is on its way (the listing says stopping, or has not caught up), reads the
@@ -718,7 +733,22 @@ impl CloudWorkspacesDialog {
                             .rounded_full()
                             .bg(tone_color(tone)),
                     )
-                    .child(div().min_w_0().flex_1().child(text)),
+                    .child(div().min_w_0().flex_1().child(text))
+                    .when(
+                        matches!(row.stop, Some(StopReport::StillRunning(_))),
+                        |line| {
+                            // It was resumed on purpose by other means (sbx run, another
+                            // computer): the line stays only until the user says so.
+                            let dismissed = cloud.clone();
+                            line.child(
+                                Self::button(id("dismiss-stop"), "Dismiss", false, false).on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.dismiss_stop(&dismissed, cx)
+                                    }),
+                                ),
+                            )
+                        },
+                    ),
             );
         }
         if let Some(error) = self.errors.get(&key) {

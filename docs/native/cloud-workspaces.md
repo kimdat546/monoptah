@@ -116,7 +116,12 @@ auto-stop alike):
    The same close runs when **two consecutive listings** show a sandbox stopping or stopped while a
    tunnel to it is still open (a stop by the TTL, by another computer or by hand), except while the
    user's own Reconnect is bringing it back or a start of it is pending: a single, possibly stale,
-   listing never closes a connection somebody has just opened.
+   listing never closes a connection somebody has just opened. A listing also never closes a
+   connection that was opened **after the listing was read** (a Reconnect that finished while the
+   listing was being processed): the listing's read time is compared with the tunnel's start time.
+   If the connection is busy (a request holds its lock), the close is **deferred**: it closes
+   when that request ends, and the Stop's warning says "the app's connection to it is busy… it may
+   wake the sandbox again".
 2. **It verifies the result from read-only listings** (`sbx ls`, never `exec`, `ssh`, `attach` or
    `cp`, which would wake it) instead of trusting the call. The row's state comes from the listing
    and a line under it tells what became of the Stop; while it is on its way the dialog reads the
@@ -128,8 +133,8 @@ auto-stop alike):
    | `Stopping…` | The stop was accepted and the listing says stopping (or has not caught up: a listing that still says running up to 60 s after the request is not a verdict). |
    | `Taking longer than expected: still stopping after 11m…` | Still stopping 10 minutes after the request. It keeps being read; it may still bill. |
    | `Stopped` | The listing says stopped. |
-   | `Still running: <reason>` | The listing says running more than 60 s after the request, **or running again after it had been seen stopped** (another computer's tunnel, the TTL, Auto-resume traffic). The reason names Auto-resume and whether Monoptah's own connection was closed. It stays until the user stops it again, brings it back with Reconnect (a Reconnect that really goes ahead; a refused or duplicate one, such as a send into a stopping sandbox, leaves it), or it is seen stopped. A workspace is never quietly "Running" again after a Stop. |
-   | `Could not read the state of …: <problem>` | The Stop is followed but the sandbox listing failed, or no longer lists it. It is read again slowly; it is given up after three readable listings without the sandbox, or 30 minutes after the request. |
+   | `Still running: <reason>` | The listing says running more than 60 s after the request, **or running again after it had been seen stopped** (another computer's tunnel, the TTL, Auto-resume traffic). The reason names Auto-resume and whether Monoptah's own connection was closed. It stays until the user stops it again, brings it back with Reconnect (a Reconnect that really goes ahead; a refused or duplicate one, such as a send into a stopping sandbox, leaves it), or it is seen stopped, or a start (or its Retry) binds to the sandbox, or the user presses **Dismiss** on the line (for a sandbox resumed on purpose by other means, such as `sbx run` or another computer). A workspace is never quietly "Running" again after a Stop. |
+   | `Could not read the state of …: <problem>` | The Stop is followed but the sandbox listing failed, or no longer lists it. It is read again slowly; it is given up after three readable listings without the sandbox, or 30 minutes after the request. Only a load of a project that lists the sandbox counts: another project's load (the footer chip after a project switch) neither counts nor says anything about it. |
    | the error | The call itself failed (shown as the row's error as before). |
 
    Only a **sandbox** Stop of this app is followed. A codespace Stop is left as it was (no line, no

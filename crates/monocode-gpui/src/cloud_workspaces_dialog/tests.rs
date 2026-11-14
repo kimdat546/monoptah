@@ -1746,3 +1746,41 @@ fn report_line_absent(
     let mut visual = draw(window, cx);
     bounds(&mut visual, &format!("cloud-ws-stop-report-{USED}")).is_none()
 }
+
+#[gpui::test]
+fn a_still_running_line_has_a_dismiss_that_removes_it(cx: &mut TestAppContext) {
+    use monocode_core::cloud_sessions::stopping::StopReport;
+    let w = world();
+    let window = open(&w, cx);
+    window
+        .update(cx, |d, _, cx| {
+            cx.notify();
+            let view = d.view.as_mut().unwrap();
+            for row in view.rows.iter_mut() {
+                row.stop = match row.cloud.name.as_str() {
+                    SBX_USED => Some(StopReport::StillRunning("fake reason".into())),
+                    SBX_LOST => Some(StopReport::Stopping),
+                    _ => None,
+                };
+            }
+        })
+        .unwrap();
+    let mut visual = draw(&window, cx);
+    assert!(bounds(&mut visual, &format!("cloud-ws-stop-report-{SBX_USED}")).is_some());
+    // Only a settled "Still running" can be dismissed, not a stop on its way.
+    assert!(bounds(&mut visual, &format!("cloud-ws-dismiss-stop-{SBX_USED}")).is_some());
+    assert!(bounds(&mut visual, &format!("cloud-ws-dismiss-stop-{SBX_LOST}")).is_none());
+
+    click(&mut visual, &format!("cloud-ws-dismiss-stop-{SBX_USED}"));
+    let row = window
+        .read_with(&visual, |d, _| view_row(d, SBX_USED))
+        .unwrap();
+    assert_eq!(row.stop, None);
+    visual.refresh().unwrap();
+    assert!(bounds(&mut visual, &format!("cloud-ws-stop-report-{SBX_USED}")).is_none());
+    // The Stop of the other row is untouched.
+    let other = window
+        .read_with(&visual, |d, _| view_row(d, SBX_LOST))
+        .unwrap();
+    assert_eq!(other.stop, Some(StopReport::Stopping));
+}

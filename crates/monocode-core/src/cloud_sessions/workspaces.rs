@@ -578,7 +578,7 @@ impl CloudSessions {
     fn finish_view(&self, view: &mut WorkspaceOverview, now: u64) {
         order(&mut view.rows);
         self.apply_stop_reports(view, now);
-        self.close_connections_of_stopped(&view.rows);
+        self.close_connections_of_stopped(&view.rows, view.loaded_ms);
     }
 
     /// A read for the dialog's follow tick while a Stop is on its way: the sandbox listing only
@@ -850,7 +850,7 @@ impl CloudSessions {
     }
 
     /// The project folders of the local sessions moved into `cloud`.
-    fn moved_projects(&self, cloud: &CloudRef) -> Vec<String> {
+    pub(super) fn moved_projects(&self, cloud: &CloudRef) -> Vec<String> {
         let Ok(store) = self.store() else {
             return Vec::new();
         };

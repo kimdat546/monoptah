@@ -598,9 +598,13 @@ impl Host for FakeHost {
         self.machines.lock().unwrap().retain(|m| m.id != id);
         Ok(())
     }
-    fn close_connection(&self, id: &str) -> Result<bool, String> {
+    fn close_connection(
+        &self,
+        id: &str,
+        _: Option<u64>,
+    ) -> Result<crate::remote::TunnelClose, String> {
         self.closed.lock().unwrap().push(id.to_owned());
-        Ok(true)
+        Ok(crate::remote::TunnelClose::Closed)
     }
 }
 
@@ -5821,7 +5825,7 @@ fn a_listing_never_closes_the_connection_of_a_sandbox_with_a_start_pending() {
         row
     };
     for _ in 0..4 {
-        fx.svc.close_connections_of_stopped(&[row()]);
+        fx.svc.close_connections_of_stopped(&[row()], 1);
     }
     assert!(
         fx.host.closed.lock().unwrap().is_empty(),
@@ -5829,6 +5833,18 @@ fn a_listing_never_closes_the_connection_of_a_sandbox_with_a_start_pending() {
     );
     // Once the start is gone the same readings close it.
     super::startup::remove_start_record(&fx.store.lock().unwrap(), record.session_id).unwrap();
-    fx.svc.close_connections_of_stopped(&[row()]);
+    fx.svc.close_connections_of_stopped(&[row()], 1);
     assert_eq!(*fx.host.closed.lock().unwrap(), ["m-open"]);
+}
+
+#[test]
+fn a_start_that_binds_to_the_sandbox_clears_what_was_said_about_its_last_stop() {
+    let fx = fx();
+    let (session, record) = fx.begin().unwrap();
+    let cloud = super::backend::CloudRef::sandbox(record.sandbox.clone().unwrap());
+    fx.svc
+        .note_stop_accepted(&cloud, super::stopping::Connection::NoneOpen);
+    assert_eq!(fx.svc.stops.lock().unwrap().followed(), 1);
+    fx.run(session.id).0.unwrap();
+    assert_eq!(fx.svc.stops.lock().unwrap().followed(), 0);
 }
