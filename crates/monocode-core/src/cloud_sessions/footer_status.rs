@@ -78,7 +78,7 @@ pub fn concern_of(row: &WorkspaceRow, now_ms: u64) -> Option<Concern> {
     let up = is_up(row.state);
     if row.state == WorkspaceState::Failed {
         Some(Concern::Failed)
-    } else if is_stopping(row.state) {
+    } else if row.going_down() {
         // Neutral while it goes down; stuck once it has taken too long. An orphan is not
         // flagged for this: nothing more can be done for it than wait.
         row.stopping_since_ms
@@ -104,13 +104,6 @@ fn is_up(state: WorkspaceState) -> bool {
     matches!(state, WorkspaceState::Running | WorkspaceState::Starting)
 }
 
-fn is_stopping(state: WorkspaceState) -> bool {
-    matches!(
-        state,
-        WorkspaceState::Stopping | WorkspaceState::Hibernating
-    )
-}
-
 impl FooterStatus {
     /// Reads `view` as of `now_ms` (the age of a workspace is measured against it, not against
     /// when the view was loaded: a cached view keeps aging).
@@ -118,7 +111,7 @@ impl FooterStatus {
         let mut status = Self::default();
         for row in &view.rows {
             let up = is_up(row.state);
-            let going_down = is_stopping(row.state);
+            let going_down = row.going_down();
             let concern = concern_of(row, now_ms);
             status.running += usize::from(up);
             status.stopping += usize::from(going_down);

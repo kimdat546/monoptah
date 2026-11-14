@@ -102,15 +102,21 @@ auto-stop alike):
 1. **It closes its own connection first.** A session of a sandbox holds an ssh tunnel
    (`sbx --cloud ssh-connect`, with keepalives) to it. Before the stop is sent, the tunnels of every
    machine of that sandbox are closed (the ssh process is killed, which ends the `ssh-connect`
-   child). The machine itself is kept: the session's **Reconnect** pairs it again, and nothing else
+   child). The close is immediate and never waits for a tunnel that is being started. On macOS
+   and Linux that the `sbx ssh-connect` child exits within a second was **measured on macOS
+   only**; on Windows `Child::kill` ends `ssh.exe`, and the child's exit there is not verified.
+   Everything the stop needs (the sandbox's id and Docker account) is resolved first, so a stop that
+   cannot even be sent leaves the connections as they were. The machine itself is kept: the session's **Reconnect** pairs it again, and nothing else
    does. Background work never reconnects a sandbox (`SANDBOX_NOT_CONNECTED`); only a send, a click
    on Reconnect or on a file link resumes it. If the stop itself is refused, the error says the
    sessions need Reconnect because their connection was already closed. If closing fails, the stop
-   is still sent (a sandbox that keeps billing is worse) and the reason shown if it comes back
+   is still sent (a sandbox that keeps billing is worse), the Stop's own warning says "Stop sent,
+   but the app could not close its connection to it", and the reason shown if it comes back
    says so. A codespace has no such tunnel to close and is left as it was.
-   The same close runs whenever a listing shows a sandbox stopping or stopped while a tunnel to it
-   is still open (a stop by the TTL, by another computer or by hand), except while the user's own
-   Reconnect is bringing it back.
+   The same close runs when **two consecutive listings** show a sandbox stopping or stopped while a
+   tunnel to it is still open (a stop by the TTL, by another computer or by hand), except while the
+   user's own Reconnect is bringing it back or a start of it is pending: a single, possibly stale,
+   listing never closes a connection somebody has just opened.
 2. **It verifies the result from read-only listings** (`sbx ls`, never `exec`, `ssh`, `attach` or
    `cp`, which would wake it) instead of trusting the call. The row's state comes from the listing
    and a line under it tells what became of the Stop; while it is on its way the dialog reads the
@@ -122,12 +128,25 @@ auto-stop alike):
    | `Stopping…` | The stop was accepted and the listing says stopping (or has not caught up: a listing that still says running up to 60 s after the request is not a verdict). |
    | `Taking longer than expected: still stopping after 11m…` | Still stopping 10 minutes after the request. It keeps being read; it may still bill. |
    | `Stopped` | The listing says stopped. |
-   | `Still running: <reason>` | The listing says running more than 60 s after the request, or again later. The reason names Auto-resume and whether Monoptah's own connection was closed. It stays until the user stops it again, brings it back with Reconnect, or it is seen stopped. A workspace is never quietly "Running" again after a Stop. |
+   | `Still running: <reason>` | The listing says running more than 60 s after the request, **or running again after it had been seen stopped** (another computer's tunnel, the TTL, Auto-resume traffic). The reason names Auto-resume and whether Monoptah's own connection was closed. It stays until the user stops it again, brings it back with Reconnect (a Reconnect that really goes ahead; a refused or duplicate one, such as a send into a stopping sandbox, leaves it), or it is seen stopped. A workspace is never quietly "Running" again after a Stop. |
+   | `Could not read the state of …: <problem>` | The Stop is followed but the sandbox listing failed, or no longer lists it. It is read again slowly; it is given up after three readable listings without the sandbox, or 30 minutes after the request. |
    | the error | The call itself failed (shown as the row's error as before). |
 
-   The state of a workspace stopped by someone else, or before this app started, is told by the
-   listing alone (the row and the chip), and counted from the first listing that showed it
-   stopping.
+   Only a **sandbox** Stop of this app is followed. A codespace Stop is left as it was (no line, no
+   polling). The state of a workspace stopped by someone else, or before this app started, is told
+   by the listing alone (the row and the chip), and counted from the first listing that showed it
+   stopping. A sandbox that is being **deleted** is neither stopping nor followed.
+
+   The follow tick reads only the sandbox listing (`sbx ls`, once per Docker account), merged into
+   the rows loaded last; Refresh and opening the dialog still read `gh` too.
+
+   The memory of a Stop is **in this process only**. After an app restart the Stop line is gone
+   and the chip's 15-minute timer restarts at the first listing that shows the sandbox stopping
+   (the row's state is always read from the listing, so nothing is hidden); a second Stop of a
+   sandbox already shown stopping keeps the first request time.
+
+   The app API's `cloud.stop` and a Mono's answer keep their `stopped: true` field, which now
+   means the stop was **requested and accepted**, not that the sandbox has stopped.
 
 ## Loading
 
@@ -147,13 +166,14 @@ item stays.
 * **Shown** while at least one workspace of the open project is **Running or Starting**, and also
   while one is **Stopping** (or hibernating, on its way to stopped): a stopping sandbox still bills
   until it has stopped, and a Stop that gets stuck must not make the chip vanish. It hides only when
-  every workspace is stopped or gone; then it is not drawn and takes no room. It reports on **the
-  window's project** on every tab: a session, the MonoCrab (Mono) tab, an app view (Today, Inbox,
-  Notes, Contributors…), a terminal or a file pane, whatever folder that tab shows. Only a cloud
-  session uses its own project, the local one it belongs to (its folder is `remote://…`). A window on
-  a remote project that is not a cloud session of a local one shows no chip. One place decides this
-  (`Shell::cloud_chip_project`, `crates/monocode-gpui/src/shell.rs`) and runs whenever the tab, the
-  app view or the project changes.
+  every workspace is stopped or gone; then it is not drawn and takes no room. A sandbox that is
+  being deleted does not count as stopping. It reports on **the window's project** on every tab: a
+  session, the MonoCrab (Mono) tab, an app view (Today, Inbox, Notes, Contributors…), a terminal or a
+  file pane, whatever folder that tab shows. Only a cloud session uses its own project, the local one
+  it belongs to (its folder is `remote://…`). A window on a remote project that is not a cloud
+  session of a local one shows no chip. One place decides this (`Shell::cloud_chip_project`,
+  `crates/monocode-gpui/src/shell.rs`) and runs whenever the tab, the app view or the project
+  changes.
 * **Warning colour** (the theme's warning amber) when any workspace has a concern:
   * **Failed**: the workspace is in a failed state;
   * **Orphan**: it is this app's (see "Whose workspace it is"), no live session uses it and it is

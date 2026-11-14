@@ -1653,6 +1653,13 @@ impl CloudSessions {
     /// ([`crate::remote::SANDBOX_NOT_CONNECTED`]). `Ok` says the request was accepted, not that
     /// the workspace has stopped: [`stopping`] tells what became of it from the listings.
     pub fn stop_cloud(&self, cloud: &CloudRef) -> Result<(), String> {
+        self.stop_cloud_noted(cloud).map(|_| ())
+    }
+
+    /// [`Self::stop_cloud`] that also says what the caller should show although the stop was
+    /// accepted: the app could not close its own connection to the sandbox, so that connection
+    /// may wake it again.
+    pub fn stop_cloud_noted(&self, cloud: &CloudRef) -> Result<Option<String>, String> {
         let backend = self.backend(cloud.kind)?;
         {
             let store = self.store()?;
@@ -1667,6 +1674,20 @@ impl CloudSessions {
                 )?;
             }
         }
+        // Everything the stop needs is resolved BEFORE a connection is closed: a failure here
+        // (the sandbox's id, its pinned account) must not leave the sessions disconnected while
+        // the sandbox keeps running.
+        if let Err(error) = backend.prepare_stop(&cloud.name) {
+            self.invalidate_ref(cloud);
+            self.forget_workspace_views();
+            return if backend.is_missing_error(&error) {
+                self.mark_gone(cloud);
+                self.forget_stop(cloud);
+                Ok(None)
+            } else {
+                Err(error)
+            };
+        }
         let connection = self.close_connections_before_stop(cloud);
         let stopped = match backend.stop(&cloud.name) {
             // An instance that no longer exists (deleted by another process or by hand) is
@@ -1675,11 +1696,12 @@ impl CloudSessions {
             Err(error) if backend.is_missing_error(&error) => {
                 self.mark_gone(cloud);
                 self.forget_stop(cloud);
-                Ok(())
+                Ok(None)
             }
             Ok(()) => {
-                self.note_stop_accepted(cloud, connection.clone());
-                Ok(())
+                let warning = connection.warning();
+                self.note_stop_accepted(cloud, connection);
+                Ok(warning)
             }
             Err(error) => Err(match connection {
                 stopping::Connection::Closed(_) => format!(

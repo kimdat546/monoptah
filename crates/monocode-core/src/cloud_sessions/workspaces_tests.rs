@@ -2,7 +2,7 @@
 //! numbers, the stop and delete flows (a sandbox that hibernates included) and degradation.
 use super::backend::docker::{SandboxShell, ShellOutput};
 use super::docker_start::StoreSecrets;
-use super::stopping::StopReport;
+use super::stopping::{StopReport, STOP_EXPECTED};
 use super::workspaces::*;
 use super::{CloudRef, CloudSessions, DeleteOutcome, Host};
 use crate::codespaces::{GhOutput, GhRunner};
@@ -1928,7 +1928,7 @@ fn a_stop_is_followed_from_stopping_to_stopped_by_the_listing() {
 fn a_stop_that_takes_longer_than_expected_is_said_so_and_keeps_counting() {
     let t = stop_fx();
     t.fx.svc.stop_cloud(&t.cloud()).unwrap();
-    t.advance(STOP_EXPECTED_SECS - 1);
+    t.advance(STOP_EXPECTED.as_secs() - 1);
     assert_eq!(t.read().stop, Some(StopReport::Stopping));
     t.advance(1);
     let row = t.read();
@@ -1943,8 +1943,6 @@ fn a_stop_that_takes_longer_than_expected_is_said_so_and_keeps_counting() {
         "still counted from the request, not from the last read"
     );
 }
-
-const STOP_EXPECTED_SECS: u64 = 10 * 60;
 
 #[test]
 fn a_sandbox_that_is_running_again_after_a_stop_is_told_never_silently_running() {
@@ -2010,6 +2008,41 @@ fn a_stop_the_cli_refuses_is_an_error_and_nothing_is_followed() {
 }
 
 #[test]
+fn a_codespace_stop_is_not_followed_reported_or_polled() {
+    let fx = fx(
+        Gh::new(json!([codespace(
+            "octo-used",
+            "basicLinux32gb",
+            "Available",
+            hours_ago(3.0)
+        )])),
+        Sbx::new(vec![]),
+    );
+    let cloud = CloudRef::codespace("octo-used");
+    add_session(&fx.store, PROJECT, &cloud);
+    fx.svc.stop_cloud(&cloud).unwrap();
+    assert_eq!(fx.svc.stops.lock().unwrap().followed(), 0, "nothing noted");
+    // Even if the listing lags past the grace period and says running, or says stopping, no
+    // sandbox text and no report appear: the row is the listing's state alone.
+    let row = fx.svc.workspaces_overview(PROJECT, true).rows[0].clone();
+    assert_eq!(row.stop, None);
+    *fx.gh.list.lock().unwrap() = json!([codespace(
+        "octo-used",
+        "basicLinux32gb",
+        "ShuttingDown",
+        hours_ago(3.0)
+    )])
+    .to_string();
+    let row = fx.svc.workspaces_overview(PROJECT, true).rows[0].clone();
+    assert_eq!(row.state, WorkspaceState::Stopping);
+    assert_eq!(
+        row.stop, None,
+        "no report, so the dialog never polls for it"
+    );
+    assert!(row.stopping_since_ms.is_some(), "the chip still times it");
+}
+
+#[test]
 fn a_stopped_codespace_closes_no_connection() {
     let gh = Gh::new(json!([codespace(
         "octo-used",
@@ -2041,6 +2074,11 @@ fn a_listing_that_shows_a_sandbox_down_closes_the_tunnel_that_would_wake_it_agai
     // Someone else stopped it (the TTL, another computer): this app's tunnel is still open.
     t.set_state("stopped");
     t.read();
+    assert!(
+        t.host.closed.lock().unwrap().is_empty(),
+        "one reading may be stale: a connection somebody just opened is not closed on it"
+    );
+    t.read();
     let closed = t.host.closed.lock().unwrap().clone();
     assert_eq!(
         closed.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
@@ -2052,7 +2090,7 @@ fn a_listing_that_shows_a_sandbox_down_closes_the_tunnel_that_would_wake_it_agai
         "the machine is kept"
     );
     // Nothing was woken or deleted to find out.
-    assert_eq!(t.fx.sbx.verbs().iter().filter(|v| *v == "ls").count(), 1);
+    assert_eq!(t.fx.sbx.verbs().iter().filter(|v| *v == "ls").count(), 2);
     assert!(!t
         .fx
         .sbx
@@ -2069,8 +2107,205 @@ fn a_running_sandbox_keeps_its_tunnel_and_so_does_one_a_reconnect_is_bringing_ba
     t.set_state("stopped");
     t.fx.svc.reconnecting.lock().unwrap().insert(WORKING.into());
     t.read();
+    t.read();
+    t.read();
     assert!(
         t.host.closed.lock().unwrap().is_empty(),
         "the user is resuming it right now"
     );
+}
+
+#[test]
+fn a_sandbox_that_wakes_after_it_was_seen_stopped_is_never_quietly_running() {
+    use super::footer_status::{Concern, FooterStatus};
+    let t = stop_fx();
+    t.fx.svc.stop_cloud(&t.cloud()).unwrap();
+    t.set_state("stopped");
+    t.advance(20);
+    assert_eq!(t.read().stop, Some(StopReport::Stopped));
+
+    // Another computer's tunnel, the TTL or Auto-resume traffic wakes it: it must say so.
+    t.set_state("running");
+    t.advance(300);
+    let row = t.read();
+    assert_eq!(row.state, WorkspaceState::Running);
+    let Some(StopReport::StillRunning(reason)) = row.stop.clone() else {
+        panic!("quietly running again: {:?}", row.stop)
+    };
+    assert!(
+        reason.contains("after it had stopped") && reason.contains("Auto-resume"),
+        "{reason}"
+    );
+    // The chip warns too.
+    let view = t.fx.svc.workspaces_overview(PROJECT, true);
+    let status = FooterStatus::of(&view, t.clock.load(Ordering::SeqCst));
+    let entry = status.entries.iter().find(|e| e.name == WORKING).unwrap();
+    assert_eq!(entry.concern, Some(Concern::StopUndone));
+    // It stays said however long, until it is seen stopped again...
+    t.advance(7200);
+    assert_eq!(t.read().stop, row.stop);
+    t.set_state("stopped");
+    assert_eq!(t.read().stop, Some(StopReport::Stopped));
+    // ...or the user brings it back on purpose.
+    t.set_state("running");
+    t.advance(60);
+    assert!(matches!(t.read().stop, Some(StopReport::StillRunning(_))));
+    t.fx.svc.forget_stop(&t.cloud());
+    assert_eq!(t.read().stop, None);
+}
+
+#[test]
+fn a_second_stop_of_a_sandbox_already_stopping_keeps_the_first_request_time() {
+    let t = stop_fx();
+    t.fx.svc.stop_cloud(&t.cloud()).unwrap();
+    let first = t.clock.load(Ordering::SeqCst);
+    t.advance(30);
+    assert_eq!(t.read().stopping_since_ms, Some(first));
+    t.advance(30);
+    t.fx.svc.stop_cloud(&t.cloud()).unwrap();
+    t.advance(30);
+    assert_eq!(
+        t.read().stopping_since_ms,
+        Some(first),
+        "the timers do not restart"
+    );
+}
+
+#[test]
+fn a_deleting_sandbox_is_neither_stopping_nor_followed() {
+    use super::footer_status::FooterStatus;
+    let t = stop_fx();
+    t.set_state("deleting");
+    let view = t.fx.svc.workspaces_overview(PROJECT, true);
+    let row = row(&view, WORKING);
+    assert!(row.is_deleting() && !row.going_down());
+    assert_eq!((row.stop.clone(), row.stopping_since_ms), (None, None));
+    let status = FooterStatus::of(&view, t.clock.load(Ordering::SeqCst));
+    assert_eq!(status.stopping, 0, "{status:?}");
+    t.advance(3600);
+    let view = t.fx.svc.workspaces_overview(PROJECT, true);
+    assert!(!FooterStatus::of(&view, t.clock.load(Ordering::SeqCst)).warns());
+}
+
+#[test]
+fn a_stop_that_fails_before_it_is_sent_leaves_the_connections_open() {
+    let t = stop_fx();
+    // The sandbox's id cannot be read: nothing was stopped, so nothing may be disconnected.
+    *t.fx.sbx.ls_reply.lock().unwrap() = Some(Err("sbx is unreachable".into()));
+    let error = t.fx.svc.stop_cloud(&t.cloud()).unwrap_err();
+    assert!(error.contains("unreachable"), "{error}");
+    assert!(t.host.closed.lock().unwrap().is_empty(), "the tunnel stays");
+    assert!(!t.fx.sbx.verbs().contains(&"stop".to_owned()));
+    assert_eq!(t.fx.svc.stops.lock().unwrap().followed(), 0);
+}
+
+#[test]
+fn a_connection_that_could_not_be_closed_is_told_when_the_stop_is_accepted() {
+    let t = stop_fx();
+    *t.host.close_error.lock().unwrap() = Some("tunnel lock poisoned".into());
+    let note =
+        t.fx.svc
+            .stop_cloud_noted(&t.cloud())
+            .unwrap()
+            .expect("a note");
+    assert!(
+        note.contains("could not close") && note.contains("tunnel lock poisoned"),
+        "{note}"
+    );
+    *t.host.close_error.lock().unwrap() = None;
+    let t = stop_fx();
+    assert_eq!(t.fx.svc.stop_cloud_noted(&t.cloud()).unwrap(), None);
+}
+
+#[test]
+fn a_followed_stop_whose_listing_cannot_be_read_says_so_and_comes_back() {
+    let t = stop_fx();
+    t.fx.svc.stop_cloud(&t.cloud()).unwrap();
+    t.advance(10);
+    *t.fx.sbx.ls_reply.lock().unwrap() = Some(Err("sbx is unreachable".into()));
+    let view = t.fx.svc.workspaces_overview(PROJECT, true);
+    assert!(view.rows.iter().all(|r| r.cloud.name != WORKING));
+    assert_eq!(view.stop_unread.len(), 1, "{:?}", view.stop_unread);
+    let text = &view.stop_unread[0].text;
+    assert!(
+        text.starts_with(&format!("Could not read the state of {WORKING}:")),
+        "{text}"
+    );
+    // Unreadable for a long time: the stop is followed no longer than a limit.
+    t.advance(10);
+    assert_eq!(
+        t.fx.svc
+            .workspaces_overview(PROJECT, true)
+            .stop_unread
+            .len(),
+        1
+    );
+    // The listing comes back: the row, and no more notes.
+    *t.fx.sbx.ls_reply.lock().unwrap() = None;
+    t.set_state("stopped");
+    let view = t.fx.svc.workspaces_overview(PROJECT, true);
+    assert!(view.stop_unread.is_empty());
+    assert_eq!(row(&view, WORKING).stop, Some(StopReport::Stopped));
+}
+
+#[test]
+fn a_followed_stop_with_a_listing_that_stays_unreadable_is_given_up_after_a_limit() {
+    let t = stop_fx();
+    t.fx.svc.stop_cloud(&t.cloud()).unwrap();
+    *t.fx.sbx.ls_reply.lock().unwrap() = Some(Err("sbx is unreachable".into()));
+    assert_eq!(
+        t.fx.svc
+            .workspaces_overview(PROJECT, true)
+            .stop_unread
+            .len(),
+        1
+    );
+    t.advance(31 * 60);
+    assert!(t
+        .fx
+        .svc
+        .workspaces_overview(PROJECT, true)
+        .stop_unread
+        .is_empty());
+    assert_eq!(t.fx.svc.stops.lock().unwrap().followed(), 0);
+}
+
+#[test]
+fn a_followed_stop_that_never_reappears_in_a_readable_listing_is_dropped() {
+    let t = stop_fx();
+    t.fx.svc.stop_cloud(&t.cloud()).unwrap();
+    // Deleted by hand: the listing is fine and no longer has it.
+    t.fx.sbx.boxes.lock().unwrap().remove(0);
+    for _ in 0..2 {
+        let view = t.fx.svc.workspaces_overview(PROJECT, true);
+        assert_eq!(view.stop_unread.len(), 1);
+        assert!(view.stop_unread[0].text.contains("not in the listing"));
+    }
+    let view = t.fx.svc.workspaces_overview(PROJECT, true);
+    assert!(view.stop_unread.is_empty(), "given up after three listings");
+    assert_eq!(t.fx.svc.stops.lock().unwrap().followed(), 0);
+}
+
+#[test]
+fn the_follow_tick_reads_only_the_sandbox_listing() {
+    let t = stop_fx();
+    t.read();
+    let gh_calls = t.fx.gh.calls().len();
+    let ls_calls = || t.fx.sbx.verbs().iter().filter(|v| *v == "ls").count();
+    t.fx.svc.stop_cloud(&t.cloud()).unwrap();
+    t.read(); // the full forced read that follows a stop fills the cache again
+    let gh_after_full = t.fx.gh.calls().len();
+    assert!(gh_after_full > gh_calls);
+    t.advance(20);
+    t.set_state("stopped");
+    let before = ls_calls();
+    let view = t.fx.svc.refresh_sandbox_rows(PROJECT);
+    assert_eq!(
+        t.fx.gh.calls().len(),
+        gh_after_full,
+        "no gh call on the tick"
+    );
+    assert_eq!(ls_calls(), before + 1, "one more sbx ls");
+    assert_eq!(row(&view, WORKING).stop, Some(StopReport::Stopped));
+    assert_eq!(view.rows.len(), 2, "the other sandbox row is still there");
 }

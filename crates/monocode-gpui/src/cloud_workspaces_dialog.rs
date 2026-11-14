@@ -189,6 +189,13 @@ impl CloudWorkspacesDialog {
     }
 
     fn load(&mut self, force: bool, cx: &mut Context<Self>) {
+        self.load_with(force, false, cx);
+    }
+
+    /// `sandboxes_only` is the follow tick of a Stop: the sandbox listing alone (no `gh`), merged
+    /// into the rows already loaded. Asked for while another load runs, it becomes a full forced
+    /// load after it.
+    fn load_with(&mut self, force: bool, sandboxes_only: bool, cx: &mut Context<Self>) {
         if self.loading {
             self.reload_queued = Some(self.reload_queued.unwrap_or(false) || force);
             return;
@@ -201,7 +208,12 @@ impl CloudWorkspacesDialog {
                 .background_executor()
                 .spawn(async move {
                     let api = env.api()?;
-                    Ok::<_, String>(api.cloud().workspaces_overview(&project, force))
+                    let cloud = api.cloud();
+                    Ok::<_, String>(if sandboxes_only {
+                        cloud.refresh_sandbox_rows(&project)
+                    } else {
+                        cloud.workspaces_overview(&project, force)
+                    })
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -233,11 +245,12 @@ impl CloudWorkspacesDialog {
         if self.following_stop {
             return;
         }
-        let Some(every) = self
-            .view
-            .as_ref()
-            .and_then(|view| model::stop_poll(view.rows.iter().filter_map(|row| row.stop.clone())))
-        else {
+        let Some(every) = self.view.as_ref().and_then(|view| {
+            model::stop_poll(
+                view.rows.iter().filter_map(|row| row.stop.clone()),
+                !view.stop_unread.is_empty(),
+            )
+        }) else {
             return;
         };
         self.following_stop = true;
@@ -245,7 +258,7 @@ impl CloudWorkspacesDialog {
             cx.background_executor().timer(every).await;
             let _ = this.update(cx, |this, cx| {
                 this.following_stop = false;
-                this.load(true, cx);
+                this.load_with(true, true, cx);
             });
         })
         .detach();
@@ -960,6 +973,20 @@ impl CloudWorkspacesDialog {
                     .line_height(px(18.))
                     .text_color(rgb(0xfbbf24))
                     .child(text.clone())
+                    .into_any_element(),
+            );
+        }
+        for unread in &view.stop_unread {
+            let id = format!("cloud-ws-stop-unread-{}", unread.cloud.name);
+            out.push(
+                div()
+                    .id(SharedString::from(id.clone()))
+                    .debug_selector(move || id.clone())
+                    .role(Role::Alert)
+                    .text_size(px(12.))
+                    .line_height(px(18.))
+                    .text_color(rgb(0xfbbf24))
+                    .child(unread.text.clone())
                     .into_any_element(),
             );
         }

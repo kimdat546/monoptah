@@ -138,8 +138,6 @@ impl CloudSessions {
         if crate::store::is_pending_cloud_environment(&session.project.environment_id) {
             return Err(STILL_STARTING.into());
         }
-        // The user is bringing it back on purpose: what was said about its last Stop is history.
-        self.forget_stop(&cloud);
         require_claude(&session.summary.provider)?;
         let name = cloud.name.clone();
         let _flight = {
@@ -180,6 +178,9 @@ impl CloudSessions {
             }
             CloudState::Available | CloudState::Starting | CloudState::Stopped => {}
         }
+        // The reconnect really goes ahead, so the user is bringing it back on purpose: what was
+        // said about its last Stop is history. (A refused or duplicate reconnect leaves it.)
+        self.forget_stop(&cloud);
         self.invalidate_ref(&cloud);
 
         let machine = self

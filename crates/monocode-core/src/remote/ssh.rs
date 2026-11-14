@@ -1343,18 +1343,30 @@ impl Tunnels {
         drop(old);
     }
     pub fn remove(&self, id: &str) {
-        let old = self.slots().remove(id);
-        // A request in flight may still hold the slot through its lease; the tunnel itself is
-        // closed now, not when the last lease is dropped.
-        if let Some(old) = &old {
-            let tunnel = old
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .tunnel
-                .take();
-            drop(tunnel);
+        self.close(id);
+    }
+    /// Takes the tunnel of `id` out of use and closes it now, without waiting: the machine lock
+    /// is held by a (re)start for up to 20 seconds, and a caller may hold the connection store.
+    /// When the lock is busy the slot is already unreachable, so the tunnel being started is
+    /// dropped (and killed) with its last lease instead. Returns whether a live tunnel was
+    /// closed here (`false` also when it could not be looked at without waiting).
+    pub fn close(&self, id: &str) -> bool {
+        let Some(old) = self.slots().remove(id) else {
+            return false;
+        };
+        let tunnel = match old.try_lock() {
+            Ok(mut slot) => slot.tunnel.take(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().tunnel.take(),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        match tunnel {
+            Some(mut tunnel) => {
+                let live = tunnel.alive();
+                drop(tunnel);
+                live
+            }
+            None => false,
         }
-        drop(old);
     }
     /// A live tunnel for `id`, or None. Never spawns a process and holds the
     /// machine lock only for a liveness check.
@@ -3689,6 +3701,63 @@ mod tests {
         );
         assert!(!args.contains("47200"), "{args}");
     }
+    /// Whether process `pid` exists (signal 0).
+    #[cfg(unix)]
+    fn process_exists(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    /// The tunnel kill is real: the ssh process is gone, the machine stays listed, and a tunnel
+    /// is never started again by it. (On Windows `Child::kill` ends ssh.exe; whether the
+    /// `sbx ssh-connect` child then exits was measured on macOS only.)
+    #[cfg(unix)]
+    #[test]
+    fn closing_a_machines_tunnel_kills_the_process_and_keeps_the_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("remote-machines.json"),
+            r#"[{"id":"a","name":"x","endpoint":"sbx://box","environmentId":"env","token":"t","ssh":{"target":"sbx_001abc@sbx_cloud","port":null,"remotePort":3774,"sandbox":{"id":"sbx_001abc","name":"box","workspace":"/home/agent/ws","relayPort":47200}}}]"#,
+        )
+        .unwrap();
+        let connections = std::sync::Arc::new(crate::remote::Connections::new(dir.path()));
+        let tunnel = Tunnel::for_test(4321);
+        let pid = tunnel.child.id();
+        connections.tunnels.insert("a".into(), tunnel);
+        assert!(connections.tunnels.existing("a").is_some());
+        assert!(process_exists(pid));
+
+        assert!(connections.close_tunnel("a"), "a live tunnel was closed");
+        assert!(
+            !process_exists(pid),
+            "the ssh process was killed and reaped"
+        );
+        assert!(connections.tunnels.existing("a").is_none());
+        assert_eq!(connections.list().unwrap().len(), 1, "the machine is kept");
+        // Nothing left to close, and a closed tunnel is not started again by the close.
+        assert!(!connections.close_tunnel("a"));
+        assert!(!connections.close_tunnel("never-paired"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closing_a_tunnel_does_not_wait_for_a_start_that_holds_the_machine_lock() {
+        let tunnels = Tunnels::default();
+        tunnels.insert("a".into(), Tunnel::for_test(4321));
+        let slot = tunnels.slots().get("a").cloned().unwrap();
+        // `endpoint()` holds this lock for up to 20 seconds while it starts ssh.
+        let held = slot.lock().unwrap();
+        assert!(
+            !tunnels.close("a"),
+            "returns at once and has nothing to report"
+        );
+        assert!(tunnels.existing("a").is_none(), "the slot is out of use");
+        drop(held);
+    }
+
     #[test]
     fn plain_sandbox_scripts_run_in_the_outer_workspace_without_devcontainer() {
         let mut target = sandbox_target().sandbox.unwrap();

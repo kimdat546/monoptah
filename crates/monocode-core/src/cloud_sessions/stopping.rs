@@ -10,15 +10,27 @@
 //!   has been stopping for [`STOP_EXPECTED`] (the CLI says a large sandbox can take 7 to 9
 //!   minutes);
 //! * the listing says stopped: [`StopReport::Stopped`];
-//! * the listing still says running after [`STOP_GRACE`], or says running again later:
+//! * the listing still says running after [`STOP_GRACE`], or says running again after it had
+//!   been seen stopped (another computer's tunnel, the TTL, Auto-resume traffic):
 //!   [`StopReport::StillRunning`] with the reason. It stays that way until the user stops it
-//!   again or the workspace is seen stopped, so a workspace is never quietly "Running" again.
+//!   again, brings it back with Reconnect, or the workspace is seen stopped, so a workspace is
+//!   never quietly "Running" again after a Stop;
+//! * the listing cannot be read, or no longer lists the workspace: [`UnreadStop`] says so, so a
+//!   followed Stop never just disappears.
+//!
+//! Only a **Docker sandbox** is followed. A codespace has no tunnel to close and no Auto-resume;
+//! its Stop is left as it was (only the first-seen time of a stopping codespace is kept, for the
+//! footer chip).
+//!
+//! The memory is in this process only. After an app restart the Stop line is gone and the 15
+//! minute timer of the chip restarts at the first listing that shows the workspace stopping (the
+//! row's state itself is always read from the listing).
 //!
 //! Since when a workspace has been stopping ([`super::workspaces::WorkspaceRow::stopping_since_ms`])
 //! is kept here too: from the request when this app made it, else from the first listing that
 //! showed it. The footer chip warns when that passes [`STOPPING_WARN`].
-use super::workspaces::{WorkspaceRow, WorkspaceState};
-use super::{CloudRef, CloudSessions};
+use super::workspaces::{WorkspaceOverview, WorkspaceRow, WorkspaceState};
+use super::{CloudBackendKind, CloudRef, CloudSessions};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -28,6 +40,14 @@ pub const STOP_GRACE: Duration = Duration::from_secs(60);
 pub const STOP_EXPECTED: Duration = Duration::from_secs(10 * 60);
 /// The footer chip turns to a warning after a workspace has been stopping this long.
 pub const STOPPING_WARN: Duration = Duration::from_secs(15 * 60);
+/// A followed Stop whose workspace is missing from a readable listing is dropped after this many
+/// listings (it was deleted, or only another project uses it).
+const MISSING_READS: u32 = 3;
+/// A followed Stop whose listing stays unreadable is dropped this long after the request.
+const UNREAD_LIMIT: Duration = Duration::from_secs(30 * 60);
+/// A listing-based close of a tunnel waits for this many consecutive readings that show the
+/// sandbox down, so one stale listing never closes a connection somebody just opened.
+const DOWN_READS: u32 = 2;
 
 /// What the dialog says about a workspace after a Stop.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,6 +68,14 @@ impl StopReport {
     }
 }
 
+/// A followed Stop whose state could not be read in the last listing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnreadStop {
+    pub cloud: CloudRef,
+    /// `Could not read the state of …: <problem>`.
+    pub text: String,
+}
+
 /// How this app's own connection to the workspace fared before the stop was sent.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) enum Connection {
@@ -60,8 +88,21 @@ pub(super) enum Connection {
     CloseFailed(String),
 }
 
+impl Connection {
+    /// What to tell right when the stop is accepted, when the connection could not be closed.
+    pub(super) fn warning(&self) -> Option<String> {
+        match self {
+            Self::CloseFailed(error) => Some(format!(
+                "Stop sent, but the app could not close its connection to it ({error}); that connection may wake the sandbox again."
+            )),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct StopWatch {
+    cloud: Option<CloudRef>,
     /// When this process had the stop accepted; cleared once the listing settled.
     requested_ms: Option<u64>,
     /// Since when the listing has said stopping.
@@ -69,9 +110,11 @@ pub(super) struct StopWatch {
     /// A verdict that stays until the state changes again.
     settled: Option<StopReport>,
     connection: Connection,
+    /// Consecutive readable listings that did not list the workspace.
+    missing_reads: u32,
 }
 
-fn reason(connection: &Connection) -> String {
+fn reason(connection: &Connection, when: &str) -> String {
     let ours = match connection {
         Connection::NoneOpen => "Monoptah had no connection to it open.".to_owned(),
         Connection::Closed(_) => {
@@ -82,7 +125,7 @@ fn reason(connection: &Connection) -> String {
         }
     };
     format!(
-        "it was running again after the stop was accepted. A sandbox with Auto-resume starts again when anything sends it traffic: a command, or a request through an ssh tunnel that is still open (a tunnel survives a stop and the sandbox's gateway then resumes it). {ours}"
+        "it was running again {when}. A sandbox with Auto-resume starts again when anything sends it traffic: a command, or a request through an ssh tunnel that is still open (a tunnel survives a stop and the sandbox's gateway then resumes it). {ours}"
     )
 }
 
@@ -112,7 +155,9 @@ fn read(
         }
         WorkspaceState::Stopped => {
             watch.stopping_since_ms = None;
-            if watch.requested_ms.take().is_some() {
+            // Seen stopped: a Stop that was followed has ended well, and so has one that had
+            // come back (it went down again).
+            if watch.requested_ms.take().is_some() || watch.settled.is_some() {
                 watch.settled = Some(StopReport::Stopped);
             }
             (watch.settled.clone(), None)
@@ -124,10 +169,17 @@ fn read(
                     return (Some(StopReport::Stopping), None);
                 }
                 watch.requested_ms = None;
-                watch.settled = Some(StopReport::StillRunning(reason(&watch.connection)));
+                watch.settled = Some(StopReport::StillRunning(reason(
+                    &watch.connection,
+                    "after the stop was accepted",
+                )));
             } else if watch.settled == Some(StopReport::Stopped) {
-                // Started again on purpose or by someone else: the old verdict is history.
-                watch.settled = None;
+                // It had stopped and something woke it: another computer's tunnel, the TTL, a
+                // command. Never a quiet "Running" again; the user's own Reconnect forgets this.
+                watch.settled = Some(StopReport::StillRunning(reason(
+                    &watch.connection,
+                    "after it had stopped",
+                )));
             }
             (watch.settled.clone(), None)
         }
@@ -136,29 +188,44 @@ fn read(
 }
 
 #[derive(Default)]
-pub(super) struct StopWatches(HashMap<String, StopWatch>);
+pub(super) struct StopWatches {
+    watches: HashMap<String, StopWatch>,
+    /// Consecutive listings that showed the sandbox down, by cloud key.
+    down: HashMap<String, u32>,
+}
 
 #[cfg(test)]
 impl StopWatches {
     /// How many workspaces are being followed.
     pub(super) fn followed(&self) -> usize {
-        self.0.len()
+        self.watches.len()
     }
 }
 
 impl CloudSessions {
-    /// Remembers that the stop of `cloud` was accepted at the current time. `connection` is how
-    /// this app's own connection fared before it.
+    /// Remembers that the stop of the sandbox `cloud` was accepted at the current time.
+    /// `connection` is how this app's own connection fared before it. A codespace is not
+    /// followed. A second Stop of a sandbox that the listing already shows stopping keeps the
+    /// first request time, so the timers do not restart.
     pub(super) fn note_stop_accepted(&self, cloud: &CloudRef, connection: Connection) {
+        if cloud.kind != CloudBackendKind::DockerSandbox {
+            return;
+        }
         let now = (self.clock)();
         if let Ok(mut watches) = self.stops.lock() {
-            watches.0.insert(
-                cloud.key(),
+            let key = cloud.key();
+            let kept = watches
+                .watches
+                .get(&key)
+                .filter(|w| w.stopping_since_ms.is_some())
+                .and_then(|w| w.requested_ms);
+            watches.watches.insert(
+                key,
                 StopWatch {
-                    requested_ms: Some(now),
-                    stopping_since_ms: None,
-                    settled: None,
+                    cloud: Some(cloud.clone()),
+                    requested_ms: Some(kept.unwrap_or(now)),
                     connection,
+                    ..StopWatch::default()
                 },
             );
         }
@@ -167,59 +234,122 @@ impl CloudSessions {
     /// Forgets what was noted about `cloud` (it is gone, or the user resumed it).
     pub(super) fn forget_stop(&self, cloud: &CloudRef) {
         if let Ok(mut watches) = self.stops.lock() {
-            watches.0.remove(&cloud.key());
+            watches.watches.remove(&cloud.key());
+            watches.down.remove(&cloud.key());
         }
     }
 
     /// Closes the connections this app still holds to a sandbox the listing says is stopping or
     /// stopped. A tunnel survives a stop (its keepalives are answered by the gateway), and the
     /// first request a session sends through it resumes the sandbox again: that is what a Stop
-    /// from this app, another computer or the TTL would otherwise lose to. A sandbox that a
-    /// user-initiated reconnect is bringing back is left alone.
+    /// from this app, another computer or the TTL would otherwise lose to.
+    ///
+    /// It closes only after [`DOWN_READS`] consecutive listings showed the sandbox down, and
+    /// never while the user's own Reconnect is bringing it back or a start of it is pending
+    /// (another flow may just have opened a connection a stale listing knows nothing about).
     pub(super) fn close_connections_of_stopped(&self, rows: &[WorkspaceRow]) {
         for row in rows {
+            if row.cloud.kind != CloudBackendKind::DockerSandbox {
+                continue;
+            }
             let down = matches!(
                 row.state,
                 WorkspaceState::Stopping | WorkspaceState::Hibernating | WorkspaceState::Stopped
             );
-            if !down || row.cloud.kind != super::CloudBackendKind::DockerSandbox {
+            let reads = match self.stops.lock() {
+                Ok(mut watches) => {
+                    if down {
+                        let reads = watches.down.entry(row.cloud.key()).or_insert(0);
+                        *reads += 1;
+                        *reads
+                    } else {
+                        watches.down.remove(&row.cloud.key());
+                        0
+                    }
+                }
+                Err(_) => 0,
+            };
+            if reads < DOWN_READS {
                 continue;
             }
             let bringing_back = self
                 .reconnecting
                 .lock()
                 .map_or(true, |set| set.contains(&row.cloud.name));
-            if !bringing_back {
+            let starting = self.store().map_or(true, |store| {
+                super::startup::pending_starts(&store)
+                    .iter()
+                    .any(|r| r.cloud().as_ref() == Some(&row.cloud))
+            });
+            if !bringing_back && !starting {
                 let _ = self.close_connections_before_stop(&row.cloud);
             }
         }
     }
 
-    /// Reads every row of a freshly listed overview against the stops noted so far.
-    pub(super) fn apply_stop_reports(&self, rows: &mut [WorkspaceRow], now: u64) {
+    /// Reads every row of a freshly listed overview against the stops noted so far, and adds an
+    /// [`UnreadStop`] for a followed Stop that has no row.
+    pub(super) fn apply_stop_reports(&self, view: &mut WorkspaceOverview, now: u64) {
         let Ok(mut watches) = self.stops.lock() else {
             return;
         };
-        for row in rows {
+        let mut listed: Vec<String> = Vec::new();
+        for row in &mut view.rows {
             let key = row.cloud.key();
-            let tracked = watches.0.contains_key(&key);
-            let stopping = matches!(
-                row.state,
-                WorkspaceState::Stopping | WorkspaceState::Hibernating
-            );
-            if !tracked && !stopping {
+            listed.push(key.clone());
+            let tracked = watches.watches.contains_key(&key);
+            if !tracked && !row.going_down() {
                 continue;
             }
-            let watch = watches.0.entry(key.clone()).or_default();
-            let (report, since) = read(watch, row.state, now);
+            let watch = watches.watches.entry(key.clone()).or_default();
+            watch.missing_reads = 0;
+            // A sandbox that is being deleted is neither stopping nor up for these rules.
+            let state = if row.is_deleting() {
+                WorkspaceState::Unknown
+            } else {
+                row.state
+            };
+            let (report, since) = read(watch, state, now);
             row.stop = report;
             row.stopping_since_ms = since;
             if watch.requested_ms.is_none()
                 && watch.stopping_since_ms.is_none()
                 && watch.settled.is_none()
             {
-                watches.0.remove(&key);
+                watches.watches.remove(&key);
             }
+        }
+        let readable = view.sandbox_problems.is_empty();
+        let mut dropped = Vec::new();
+        for (key, watch) in watches.watches.iter_mut() {
+            let (Some(cloud), Some(requested)) = (&watch.cloud, watch.requested_ms) else {
+                continue;
+            };
+            if listed.contains(key) {
+                continue;
+            }
+            watch.missing_reads += 1;
+            let too_old = now.saturating_sub(requested) >= UNREAD_LIMIT.as_millis() as u64;
+            if (readable && watch.missing_reads >= MISSING_READS) || too_old {
+                dropped.push(key.clone());
+                continue;
+            }
+            let why = if readable {
+                "it is not in the listing (deleted, or used only by another project)".to_owned()
+            } else {
+                view.sandbox_problems
+                    .iter()
+                    .map(|p| p.problem.message())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            view.stop_unread.push(UnreadStop {
+                cloud: cloud.clone(),
+                text: format!("Could not read the state of {}: {why}", cloud.name),
+            });
+        }
+        for key in dropped {
+            watches.watches.remove(&key);
         }
     }
 }

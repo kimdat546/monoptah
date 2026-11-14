@@ -1227,6 +1227,7 @@ fn a_docker_account_that_cannot_be_listed_is_named_in_its_notice(_cx: &mut TestA
                 "Docker rejected the token. Choose another in Cloud settings.".into(),
             ),
         }],
+        stop_unread: vec![],
     };
     let notes = model::notices(&overview);
     let sbx = notes
@@ -1576,22 +1577,22 @@ fn a_stop_that_is_slow_keeps_being_read_on_a_slower_timer(cx: &mut TestAppContex
     // none when settled.
     use monocode_core::cloud_sessions::stopping::StopReport::*;
     assert_eq!(
-        model::stop_poll([Stopping].into_iter()),
+        model::stop_poll([Stopping].into_iter(), false),
         Some(model::STOP_POLL)
     );
     assert_eq!(
-        model::stop_poll([TakingLong].into_iter()),
+        model::stop_poll([TakingLong].into_iter(), false),
         Some(model::STOP_POLL_SLOW)
     );
     assert_eq!(
-        model::stop_poll([TakingLong, Stopping].into_iter()),
+        model::stop_poll([TakingLong, Stopping].into_iter(), false),
         Some(model::STOP_POLL)
     );
     assert_eq!(
-        model::stop_poll([Stopped, StillRunning("x".into())].into_iter()),
+        model::stop_poll([Stopped, StillRunning("x".into())].into_iter(), false),
         None
     );
-    assert_eq!(model::stop_poll(std::iter::empty()), None);
+    assert_eq!(model::stop_poll(std::iter::empty(), false), None);
 }
 
 #[gpui::test]
@@ -1643,4 +1644,105 @@ fn the_words_for_a_stop_that_is_slow_or_came_back_say_so_in_plain_text(cx: &mut 
         )
         .stop
     );
+}
+
+#[gpui::test]
+fn the_follow_tick_asks_only_sbx_and_a_slow_stop_is_read_on_the_slow_timer(
+    cx: &mut TestAppContext,
+) {
+    use monocode_core::cloud_sessions::stopping::StopReport;
+    let w = world();
+    let window = open(&w, cx);
+    // A stop that is taking longer than expected is on view (the report is injected: the core
+    // clock is the real one).
+    window
+        .update(cx, |d, _, cx| {
+            d.view
+                .as_mut()
+                .unwrap()
+                .rows
+                .iter_mut()
+                .find(|r| r.cloud.name == SBX_USED)
+                .unwrap()
+                .stop = Some(StopReport::TakingLong);
+            d.follow_stops(cx);
+        })
+        .unwrap();
+    let (gh_before, ls_before) = (w.gh.count("codespace list"), ls_calls(&w));
+    // Not at the quick cadence...
+    cx.executor().advance_clock(model::STOP_POLL);
+    cx.run_until_parked();
+    assert_eq!(ls_calls(&w), ls_before, "the slow timer has not fired yet");
+    // ...but at the slow one, and then without `gh`: the sandbox listing alone.
+    cx.executor()
+        .advance_clock(model::STOP_POLL_SLOW - model::STOP_POLL);
+    cx.run_until_parked();
+    assert_eq!(ls_calls(&w), ls_before + 1);
+    assert_eq!(
+        w.gh.count("codespace list"),
+        gh_before,
+        "the tick does not list codespaces"
+    );
+}
+
+#[gpui::test]
+fn a_stop_that_cannot_be_read_is_said_in_the_dialog_and_is_read_again(cx: &mut TestAppContext) {
+    use monocode_core::cloud_sessions::stopping::UnreadStop;
+    let w = world();
+    let window = open(&w, cx);
+    window
+        .update(cx, |d, _, cx| {
+            d.view.as_mut().unwrap().stop_unread = vec![UnreadStop {
+                cloud: CloudRef::sandbox(SBX_USED),
+                text: format!("Could not read the state of {SBX_USED}: fake problem"),
+            }];
+            d.follow_stops(cx);
+            cx.notify();
+        })
+        .unwrap();
+    let mut visual = draw(&window, cx);
+    assert!(
+        bounds(&mut visual, &format!("cloud-ws-stop-unread-{SBX_USED}")).is_some(),
+        "the line is on screen"
+    );
+    let before = ls_calls(&w);
+    cx.executor().advance_clock(model::STOP_POLL_SLOW);
+    cx.run_until_parked();
+    assert!(ls_calls(&w) > before, "asked again, slowly");
+}
+
+#[gpui::test]
+fn a_codespace_stop_is_never_followed_or_polled(cx: &mut TestAppContext) {
+    let w = world();
+    let window = open(&w, cx);
+    act(&window, cx, |d, cx| {
+        d.run(
+            target(CloudRef::codespace(USED)),
+            Action::Stop,
+            vec![],
+            false,
+            LiveBusy::default(),
+            cx,
+        )
+    });
+    assert_eq!(w.gh.count("codespace stop -c octo-used"), 1);
+    let row = window.read_with(cx, |d, _| view_row(d, USED)).unwrap();
+    assert_eq!(row.stop, None);
+    assert!(report_line_absent(&window, cx));
+    let (gh_before, ls_before) = (w.gh.count("codespace list"), ls_calls(&w));
+    cx.executor().advance_clock(model::STOP_POLL_SLOW * 3);
+    cx.run_until_parked();
+    // The world's hibernating sandbox is nobody's Stop of this app: no timer for it either.
+    assert_eq!(
+        (w.gh.count("codespace list"), ls_calls(&w)),
+        (gh_before, ls_before)
+    );
+}
+
+fn report_line_absent(
+    window: &WindowHandle<CloudWorkspacesDialog>,
+    cx: &mut TestAppContext,
+) -> bool {
+    let mut visual = draw(window, cx);
+    bounds(&mut visual, &format!("cloud-ws-stop-report-{USED}")).is_none()
 }

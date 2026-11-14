@@ -803,8 +803,7 @@ impl Connections {
     /// itself. Nothing reconnects a cloud machine by itself ([`SANDBOX_NOT_CONNECTED`]), so it
     /// stays closed until an explicit Reconnect. Returns whether a live tunnel was closed.
     pub fn close_tunnel(&self, machine_id: &str) -> bool {
-        let open = self.tunnels.existing(machine_id).is_some();
-        self.tunnels.remove(machine_id);
+        let open = self.tunnels.close(machine_id);
         self.host_info.drop_machine(machine_id);
         open
     }

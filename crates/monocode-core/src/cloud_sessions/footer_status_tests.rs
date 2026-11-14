@@ -52,6 +52,7 @@ fn view(rows: Vec<WorkspaceRow>) -> WorkspaceOverview {
         gh: None,
         codespaces_error: None,
         sandbox_problems: vec![],
+        stop_unread: vec![],
     }
 }
 

@@ -470,8 +470,10 @@ pub(super) fn stop_line(row: &WorkspaceRow, now_ms: u64) -> Option<(String, Tone
 /// is expected to finish, slowly once it is taking longer than expected.
 pub(super) fn stop_poll(
     row_reports: impl Iterator<Item = StopReport>,
+    unread: bool,
 ) -> Option<std::time::Duration> {
-    let mut poll = None;
+    // A Stop whose state cannot be read is asked about again, slowly: the listing may come back.
+    let mut poll = unread.then_some(STOP_POLL_SLOW);
     for report in row_reports {
         match report {
             StopReport::Stopping => return Some(STOP_POLL),
